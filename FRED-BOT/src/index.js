@@ -1,103 +1,117 @@
-import makeWASocket, {
-  DisconnectReason,
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
+  DisconnectReason,
   fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
-import qrcode from 'qrcode-terminal';
-import { config } from './config.js';
-import { handleMessage } from './commands/handler.js';
-import { getText } from './utils.js';
-import { groupSettings, saveStore } from './store.js';
+} = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
+const pino = require('pino');
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
-let sock;
-let reconnectTimer;
+const P = '.'; // command prefix
+const antilink = new Set(); // groups with antilink on
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-  let version;
-  try {
-    ({ version } = await fetchLatestBaileysVersion());
-  } catch {
-    version = undefined;
-  }
+const MENU = `*ADMIN MENU*
+${['add', 'antilink on/off', 'demote', 'getbio', 'group open/close', 'hidetag', 'kick',
+  'left', 'linkgroup', 'mute', 'poll Q | A | B', 'promote', 'revoke', 'setdesc']
+  .map((c) => `★ ${P}${c}`).join('\n')}`;
 
-  sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
-    },
-    printQRInTerminal: false,
-    browser: ['FRED BOT', 'Chrome', '1.0.0'],
-    markOnlineOnConnect: false,
-    syncFullHistory: false
-  });
+async function start() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }) });
 
   sock.ev.on('creds.update', saveCreds);
-
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      console.log('\nScan this QR using WhatsApp > Linked devices > Link a device:\n');
-      qrcode.generate(qr, { small: true });
-    }
-    if (connection === 'open') {
-      console.log(`\n✅ ${config.name} is connected to WhatsApp.`);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-    }
+    if (qr) qrcode.generate(qr, { small: true }); // scan: WhatsApp > Linked devices
+    if (connection === 'open') console.log('Bot online');
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
-        console.log('WhatsApp logged out. Delete auth_info and restart to pair again.');
-        return;
-      }
-      console.log('Connection closed. Reconnecting in 5 seconds...');
-      reconnectTimer = setTimeout(startBot, 5000);
+      if (code !== DisconnectReason.loggedOut) start();
+      else console.log('Logged out. Delete the auth folder and restart.');
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      try {
-        await handleMessage(sock, msg);
-      } catch (error) {
-        console.error('Message handler error:', error?.message || error);
-      }
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const m of messages) {
+      try { await handle(sock, m); } catch (e) { console.error(e.message); }
     }
   });
-
-  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
-    try {
-      const settings = groupSettings(id);
-      if (action === 'add' && settings.welcome) {
-        for (const participant of participants) {
-          await sock.sendMessage(id, {
-            text: `👋 Welcome @${participant.split('@')[0]} to the group! Please read the group rules.`,
-            mentions: [participant]
-          });
-        }
-      }
-    } catch (error) {
-      console.error('Welcome message error:', error?.message || error);
-    }
-  });
-
-  sock.ev.on('groups.update', () => saveStore());
 }
 
-console.log(`Starting ${config.name}...`);
-startBot().catch(error => {
-  console.error('Could not start bot:', error);
-  process.exitCode = 1;
-});
+async function handle(sock, m) {
+  if (!m.message || m.key.fromMe) return;
+  const jid = m.key.remoteJid;
+  if (!jid.endsWith('@g.us')) return; // groups only
+  const sender = m.key.participant;
+  const text = m.message.conversation || m.message.extendedTextMessage?.text ||
+    m.message.imageMessage?.caption || '';
+  const reply = (t) => sock.sendMessage(jid, { text: t }, { quoted: m });
 
-process.on('SIGINT', () => {
-  console.log('\nStopping FRED BOT safely...');
-  saveStore();
-  process.exit(0);
-});
+  const meta = await sock.groupMetadata(jid);
+  const admins = meta.participants.filter((p) => p.admin).map((p) => p.id);
+  const isAdmin = admins.includes(sender);
+  const botId = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+  const botIsAdmin = admins.includes(botId);
+
+  // AntiLink: delete group invite links and remove sender
+  if (antilink.has(jid) && /chat\.whatsapp\.com\//i.test(text) && !isAdmin && botIsAdmin) {
+    await sock.sendMessage(jid, { delete: m.key });
+    await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+    return;
+  }
+
+  if (!text.startsWith(P)) return;
+  const [cmd, ...args] = text.slice(P.length).trim().split(/\s+/);
+  const rest = args.join(' ');
+  const ctx = m.message.extendedTextMessage?.contextInfo;
+  const target = ctx?.mentionedJid?.[0] || ctx?.participant ||
+    (args[0] && /\d{6,}/.test(args[0]) ? args[0].replace(/\D/g, '') + '@s.whatsapp.net' : null);
+
+  if (cmd === 'menu') return reply(MENU);
+  if (!isAdmin) return reply('Admins only.');
+  if (!botIsAdmin) return reply('Make me an admin first.');
+
+  const needTarget = () => (target ? true : (reply('Mention, reply to, or give a number.'), false));
+  const update = (action) => needTarget() && sock.groupParticipantsUpdate(jid, [target], action);
+
+  switch (cmd) {
+    case 'add': return update('add');
+    case 'kick': return update('remove');
+    case 'promote': return update('promote');
+    case 'demote': return update('demote');
+    case 'antilink':
+      if (args[0] === 'on') antilink.add(jid); else antilink.delete(jid);
+      return reply(`AntiLink ${antilink.has(jid) ? 'ON' : 'OFF'}`);
+    case 'group':
+      await sock.groupSettingUpdate(jid, args[0] === 'close' ? 'announcement' : 'not_announcement');
+      return reply(`Group ${args[0] === 'close' ? 'closed' : 'opened'}`);
+    case 'mute':
+      await sock.groupSettingUpdate(jid, 'announcement');
+      return reply('Group muted (admins only).');
+    case 'hidetag':
+      return sock.sendMessage(jid, { text: rest || '📢', mentions: meta.participants.map((p) => p.id) });
+    case 'linkgroup':
+      return reply('https://chat.whatsapp.com/' + (await sock.groupInviteCode(jid)));
+    case 'revoke':
+      await sock.groupRevokeInvite(jid);
+      return reply('Invite link reset.');
+    case 'setdesc':
+      await sock.groupUpdateDescription(jid, rest);
+      return reply('Description updated.');
+    case 'getbio': {
+      if (!needTarget()) return;
+      const s = await sock.fetchStatus(target);
+      return reply(s?.status || 'No bio.');
+    }
+    case 'poll': {
+      const [name, ...values] = rest.split('|').map((s) => s.trim());
+      if (!name || values.length < 2) return reply('Usage: .poll Question | A | B');
+      return sock.sendMessage(jid, { poll: { name, values, selectableCount: 1 } });
+    }
+    case 'left':
+      await reply('Bye 👋');
+      return sock.groupLeave(jid);
+  }
+}
+
+start();
